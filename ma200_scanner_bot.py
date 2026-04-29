@@ -177,4 +177,5 @@ TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
 
 # Ganti bagian "if __name__ == '__main__'" jadi ini:
 if __name__ == "__main__":
+    send_telegram("✅ Bot test — koneksi Telegram berhasil!")
     scan_all()  # Jalankan sekali, lalu selesai
