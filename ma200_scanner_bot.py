@@ -17,9 +17,9 @@ TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
 BINANCE_BASE = "https://api.binance.com"
 
 def send_telegram(message):
-    url = f"https://api.telegram.org/bot8753880668:AAG8fXPJD-Zp3f-BFjoQHgEjSZPc6aAdY2U/sendMessage"
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": 243258418,
+        "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
         "parse_mode": "HTML"
     }
@@ -29,17 +29,34 @@ def send_telegram(message):
         print(f"[TELEGRAM ERROR] {e}")
 
 def get_all_usdt_pairs():
+    """Ambil semua USDT pairs dengan retry otomatis."""
     url = f"{BINANCE_BASE}/api/v3/exchangeInfo"
-    resp = requests.get(url, timeout=15)
-    data = resp.json()
-    pairs = [
-        s["symbol"]
-        for s in data["symbols"]
-        if s["quoteAsset"] == "USDT"
-        and s["status"] == "TRADING"
-        and s["isSpotTradingAllowed"]
-    ]
-    return pairs
+    for attempt in range(3):  # coba 3x kalau gagal
+        try:
+            resp = requests.get(url, timeout=30)
+            print(f"  exchangeInfo status: {resp.status_code}")
+            if resp.status_code != 200:
+                print(f"  Response: {resp.text[:200]}")
+                time.sleep(5)
+                continue
+            data = resp.json()
+            if "symbols" not in data:
+                print(f"  Response keys: {list(data.keys())}")
+                print(f"  Response: {str(data)[:300]}")
+                time.sleep(5)
+                continue
+            pairs = [
+                s["symbol"]
+                for s in data["symbols"]
+                if s["quoteAsset"] == "USDT"
+                and s["status"] == "TRADING"
+                and s["isSpotTradingAllowed"]
+            ]
+            return pairs
+        except Exception as e:
+            print(f"  Attempt {attempt+1} gagal: {e}")
+            time.sleep(5)
+    raise Exception("Gagal ambil pairs setelah 3x percobaan")
 
 def get_closes(symbol, interval, limit=215):
     url = f"{BINANCE_BASE}/api/v3/klines"
