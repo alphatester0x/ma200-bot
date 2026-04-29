@@ -2,78 +2,89 @@ import requests
 import time
 import os
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============================================================
 #  KONFIGURASI
 # ============================================================
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
+TELEGRAM_BOT_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID     = os.environ.get("TELEGRAM_CHAT_ID")
+DATA_SOURCE          = None
+MAX_WORKERS          = 10
+MAX_SIGNALS_PER_SCAN = 15  # batas maksimal notif per scan, hindari flood
 
 # ============================================================
-#  FUNGSI HELPER
+#  TELEGRAM — dengan rate limit handling & retry
+# ============================================================
+
+def send_telegram(message, retry=3):
+    """
+    Kirim pesan dengan:
+    - Jeda 1.5 detik antar pesan (aman dari Telegram rate limit)
+    - Auto retry + baca retry_after kalau kena 429
+    - Print error di log GitHub Actions supaya ketahuan
+    """
+    url     = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+
+    for attempt in range(retry):
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+
+            if resp.status_code == 200:
+                time.sleep(1.5)  # jeda wajib antar pesan
+                return True
+
+            elif resp.status_code == 429:
+                wait = resp.json().get("parameters", {}).get("retry_after", 10)
+                print(f"  [TELEGRAM 429] Rate limit! Tunggu {wait}s...")
+                time.sleep(wait + 1)
+
+            else:
+                print(f"  [TELEGRAM ERROR] {resp.status_code}: {resp.text[:300]}")
+                return False
+
+        except Exception as e:
+            print(f"  [TELEGRAM EXCEPTION] attempt {attempt+1}: {e}")
+            time.sleep(3)
+
+    print("  [TELEGRAM FAILED] Pesan gagal terkirim setelah 3x percobaan")
+    return False
+
+# ============================================================
+#  BINANCE API  (data-api.binance.vision)
 # ============================================================
 
 BINANCE_BASE = "https://data-api.binance.vision"
 
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML"
-    }
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"[TELEGRAM ERROR] {e}")
-
-def get_all_usdt_pairs():
-    """Ambil semua USDT pairs dengan retry otomatis."""
-    url = f"{BINANCE_BASE}/api/v3/exchangeInfo"
-    for attempt in range(3):  # coba 3x kalau gagal
-        try:
-            resp = requests.get(url, timeout=30)
-            print(f"  exchangeInfo status: {resp.status_code}")
-            if resp.status_code != 200:
-                print(f"  Response: {resp.text[:200]}")
-                time.sleep(5)
-                continue
-            data = resp.json()
-            if "symbols" not in data:
-                print(f"  Response keys: {list(data.keys())}")
-                print(f"  Response: {str(data)[:300]}")
-                time.sleep(5)
-                continue
-            pairs = [
-                s["symbol"]
-                for s in data["symbols"]
-                if s["quoteAsset"] == "USDT"
-                and s["status"] == "TRADING"
-                and s["isSpotTradingAllowed"]
-            ]
-            return pairs
-        except Exception as e:
-            print(f"  Attempt {attempt+1} gagal: {e}")
-            time.sleep(5)
-    raise Exception("Gagal ambil pairs setelah 3x percobaan")
-
-def get_closes(symbol, interval, limit=215):
-    url = f"{BINANCE_BASE}/api/v3/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    resp = requests.get(url, params=params, timeout=10)
+def binance_get_pairs():
+    resp = requests.get(f"{BINANCE_BASE}/api/v3/exchangeInfo", timeout=20)
+    if resp.status_code == 451:
+        raise Exception("451 - Binance diblokir dari lokasi ini")
     if resp.status_code != 200:
-        return None
-    return [float(c[4]) for c in resp.json()]
+        raise Exception(f"Binance HTTP {resp.status_code}")
+    data = resp.json()
+    if "symbols" not in data:
+        raise Exception("Binance: key 'symbols' tidak ada")
+    return [
+        s["symbol"] for s in data["symbols"]
+        if s["quoteAsset"] == "USDT"
+        and s["status"] == "TRADING"
+        and s["isSpotTradingAllowed"]
+    ]
 
-def get_candles_full(symbol, interval, limit=215):
-    """Ambil candle lengkap: open, high, low, close."""
-    url = f"{BINANCE_BASE}/api/v3/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    resp = requests.get(url, params=params, timeout=10)
+def binance_get_candles(symbol, interval, limit=215):
+    resp = requests.get(
+        f"{BINANCE_BASE}/api/v3/klines",
+        params={"symbol": symbol, "interval": interval, "limit": limit},
+        timeout=10
+    )
     if resp.status_code != 200:
         return None
     raw = resp.json()
+    if not raw:
+        return None
     return {
         "open":  [float(c[1]) for c in raw],
         "high":  [float(c[2]) for c in raw],
@@ -81,129 +92,181 @@ def get_candles_full(symbol, interval, limit=215):
         "close": [float(c[4]) for c in raw],
     }
 
+# ============================================================
+#  BYBIT API  (fallback)
+# ============================================================
+
+BYBIT_BASE = "https://api.bybit.com"
+
+def bybit_get_pairs():
+    resp = requests.get(
+        f"{BYBIT_BASE}/v5/market/instruments-info",
+        params={"category": "spot"}, timeout=20
+    )
+    if resp.status_code != 200:
+        raise Exception(f"Bybit HTTP {resp.status_code}")
+    items = resp.json().get("result", {}).get("list", [])
+    return [
+        s["symbol"] for s in items
+        if s["symbol"].endswith("USDT") and s.get("status") == "Trading"
+    ]
+
+def bybit_get_candles(symbol, interval, limit=215):
+    interval_map = {"4h": "240", "1d": "D"}
+    resp = requests.get(
+        f"{BYBIT_BASE}/v5/market/kline",
+        params={"category": "spot", "symbol": symbol,
+                "interval": interval_map[interval], "limit": limit},
+        timeout=10
+    )
+    if resp.status_code != 200:
+        return None
+    raw = resp.json().get("result", {}).get("list", [])
+    if not raw:
+        return None
+    raw = list(reversed(raw))
+    return {
+        "open":  [float(c[1]) for c in raw],
+        "high":  [float(c[2]) for c in raw],
+        "low":   [float(c[3]) for c in raw],
+        "close": [float(c[4]) for c in raw],
+    }
+
+# ============================================================
+#  AUTO-SELECT SOURCE
+# ============================================================
+
+def get_all_pairs():
+    global DATA_SOURCE
+    print("  Mencoba Binance (data-api.binance.vision)...")
+    try:
+        pairs = binance_get_pairs()
+        DATA_SOURCE = "binance"
+        print(f"  Binance OK — {len(pairs)} pairs")
+        return pairs
+    except Exception as e:
+        print(f"  Binance gagal: {e}")
+
+    print("  Mencoba Bybit...")
+    try:
+        pairs = bybit_get_pairs()
+        DATA_SOURCE = "bybit"
+        print(f"  Bybit OK — {len(pairs)} pairs")
+        return pairs
+    except Exception as e:
+        print(f"  Bybit gagal: {e}")
+
+    raise Exception("Semua sumber data gagal!")
+
+def get_candles(symbol, interval, limit=215):
+    if DATA_SOURCE == "binance":
+        return binance_get_candles(symbol, interval, limit)
+    return bybit_get_candles(symbol, interval, limit)
+
+# ============================================================
+#  PRE-FILTER
+# ============================================================
+
+def pre_filter(pairs):
+    skip = [
+        "UPUSDT","DOWNUSDT","BEARUSDT","BULLUSDT",
+        "USDCUSDT","BUSDUSDT","TUSDUSDT","FDUSDUSDT",
+        "PYUSDUSDT","USDSUSDT","DAIUSDT","USDTUSDT",
+        "3LUSDT","3SUSDT","5LUSDT","5SUSDT",
+    ]
+    filtered = [p for p in pairs if not any(k in p for k in skip)]
+    print(f"  Pre-filter: {len(pairs)} → {len(filtered)} pairs")
+    return filtered
+
+# ============================================================
+#  INDIKATOR
+# ============================================================
+
 def calc_ma(closes, period):
-    if len(closes) < period:
+    if closes is None or len(closes) < period:
         return None
     return sum(closes[-period:]) / period
 
 def calc_rsi(closes, period=14):
-    """Hitung RSI sederhana."""
-    if len(closes) < period + 1:
+    if closes is None or len(closes) < period + 1:
         return None
-    deltas = [closes[i+1] - closes[i] for i in range(len(closes)-1)]
-    gains  = [d if d > 0 else 0 for d in deltas]
-    losses = [-d if d < 0 else 0 for d in deltas]
+    deltas   = [closes[i+1] - closes[i] for i in range(len(closes)-1)]
+    gains    = [d if d > 0 else 0 for d in deltas]
+    losses   = [-d if d < 0 else 0 for d in deltas]
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
     if avg_loss == 0:
         return 100
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    return 100 - (100 / (1 + avg_gain / avg_loss))
 
 # ============================================================
-#  4 JENIS SINYAL
+#  SCAN 1 TOKEN
 # ============================================================
 
-def check_signal_1_ma200_cross(closes_4h, closes_1d):
-    """Sinyal 1: Candle baru crossing ke atas MA200 di 4H atau 1D."""
-    results = []
-    for closes, tf in [(closes_4h, "4H"), (closes_1d, "1D")]:
-        if closes is None or len(closes) < 202:
-            continue
-        ma_prev = calc_ma(closes[:-1], 200)
-        ma_curr = calc_ma(closes, 200)
-        if ma_prev and ma_curr:
-            if closes[-2] < ma_prev and closes[-1] > ma_curr:
-                results.append({
-                    "tf": tf,
-                    "close": closes[-1],
-                    "ma200": ma_curr,
-                    "detail": f"Close <b>{closes[-1]:.4f}</b> baru crossing MA200 <b>{ma_curr:.4f}</b>"
-                })
-    return results
+def scan_symbol(symbol):
+    signals = []
+    try:
+        c4h = get_candles(symbol, "4h", 215)
+        c1d = get_candles(symbol, "1d", 215)
+        closes_4h = c4h["close"] if c4h else None
+        closes_1d = c1d["close"] if c1d else None
 
-def check_signal_2_rsi_recovery(closes_4h, closes_1d):
-    """Sinyal 2: Close di atas MA200 + RSI baru naik dari oversold (<35)."""
-    results = []
-    for closes, tf in [(closes_4h, "4H"), (closes_1d, "1D")]:
-        if closes is None or len(closes) < 215:
-            continue
-        ma200 = calc_ma(closes, 200)
-        if ma200 is None or closes[-1] <= ma200:
-            continue
-        rsi_curr = calc_rsi(closes, 14)
-        rsi_prev = calc_rsi(closes[:-1], 14)
-        if rsi_curr and rsi_prev:
-            if rsi_prev < 35 and rsi_curr >= 35:
-                results.append({
-                    "tf": tf,
-                    "close": closes[-1],
-                    "ma200": ma200,
-                    "rsi": rsi_curr,
-                    "detail": (
-                        f"Close <b>{closes[-1]:.4f}</b> > MA200 <b>{ma200:.4f}</b>\n"
-                        f"📊 RSI recovery: <b>{rsi_prev:.1f}</b> → <b>{rsi_curr:.1f}</b>"
-                    )
-                })
-    return results
+        # Sinyal 1 — MA200 Cross
+        for closes, tf in [(closes_4h, "4H"), (closes_1d, "1D")]:
+            if closes is None or len(closes) < 202:
+                continue
+            ma_prev = calc_ma(closes[:-1], 200)
+            ma_curr = calc_ma(closes, 200)
+            if ma_prev and ma_curr and closes[-2] < ma_prev and closes[-1] > ma_curr:
+                signals.append(("MA200_CROSS", tf,
+                    f"Close <b>{closes[-1]:.4f}</b> crossing MA200 <b>{ma_curr:.4f}</b>"))
 
-def check_signal_3_ma50_cross_4h(closes_4h):
-    """Sinyal 3: Close baru crossing ke atas MA50 di 4H."""
-    if closes_4h is None or len(closes_4h) < 52:
-        return []
-    ma50_prev = calc_ma(closes_4h[:-1], 50)
-    ma50_curr = calc_ma(closes_4h, 50)
-    if ma50_prev and ma50_curr:
-        if closes_4h[-2] < ma50_prev and closes_4h[-1] > ma50_curr:
-            return [{
-                "tf": "4H",
-                "close": closes_4h[-1],
-                "ma50": ma50_curr,
-                "detail": f"Close <b>{closes_4h[-1]:.4f}</b> baru crossing MA50 <b>{ma50_curr:.4f}</b>"
-            }]
-    return []
+        # Sinyal 2 — RSI Recovery
+        for closes, tf in [(closes_4h, "4H"), (closes_1d, "1D")]:
+            if closes is None or len(closes) < 215:
+                continue
+            ma200 = calc_ma(closes, 200)
+            if ma200 is None or closes[-1] <= ma200:
+                continue
+            rsi_curr = calc_rsi(closes)
+            rsi_prev = calc_rsi(closes[:-1])
+            if rsi_curr and rsi_prev and rsi_prev < 35 and rsi_curr >= 35:
+                signals.append(("RSI_RECOVERY", tf,
+                    f"Close <b>{closes[-1]:.4f}</b> > MA200 <b>{ma200:.4f}</b>\n"
+                    f"RSI: <b>{rsi_prev:.1f}</b> → <b>{rsi_curr:.1f}</b>"))
 
-def check_signal_4_pullback_bounce(candles_4h, candles_1d):
-    """
-    Sinyal 4: Pullback ke MA200 lalu bounce.
-    Low menyentuh MA200 (dalam 1%), tapi close di atas MA200
-    dengan body candle bullish > 0.5%.
-    """
-    results = []
-    for candles, tf in [(candles_4h, "4H"), (candles_1d, "1D")]:
-        if candles is None or len(candles["close"]) < 202:
-            continue
-        closes = candles["close"]
-        lows   = candles["low"]
-        opens  = candles["open"]
-        ma200  = calc_ma(closes, 200)
-        if ma200 is None:
-            continue
-        curr_close = closes[-1]
-        curr_low   = lows[-1]
-        curr_open  = opens[-1]
+        # Sinyal 3 — MA50 Cross 4H
+        if closes_4h and len(closes_4h) >= 52:
+            ma50_prev = calc_ma(closes_4h[:-1], 50)
+            ma50_curr = calc_ma(closes_4h, 50)
+            if ma50_prev and ma50_curr and closes_4h[-2] < ma50_prev and closes_4h[-1] > ma50_curr:
+                signals.append(("MA50_CROSS", "4H",
+                    f"Close <b>{closes_4h[-1]:.4f}</b> crossing MA50 <b>{ma50_curr:.4f}</b>"))
 
-        touched_ma    = curr_low <= ma200 * 1.01
-        close_above   = curr_close > ma200
-        candle_body   = (curr_close - curr_open) / curr_open * 100
-        strong_bounce = candle_body > 0.5
+        # Sinyal 4 — Pullback Bounce
+        for candles, tf in [(c4h, "4H"), (c1d, "1D")]:
+            if candles is None or len(candles["close"]) < 202:
+                continue
+            closes = candles["close"]
+            ma200  = calc_ma(closes, 200)
+            if ma200 is None:
+                continue
+            curr_close = closes[-1]
+            curr_low   = candles["low"][-1]
+            curr_open  = candles["open"][-1]
+            body       = (curr_close - curr_open) / curr_open * 100
+            if curr_low <= ma200 * 1.01 and curr_close > ma200 and body > 0.5:
+                signals.append(("PULLBACK_BOUNCE", tf,
+                    f"Low <b>{curr_low:.4f}</b> sentuh MA200 <b>{ma200:.4f}</b>\n"
+                    f"Bounce close <b>{curr_close:.4f}</b> (+{body:.1f}%)"))
 
-        if touched_ma and close_above and strong_bounce:
-            results.append({
-                "tf": tf,
-                "close": curr_close,
-                "low": curr_low,
-                "ma200": ma200,
-                "body_pct": candle_body,
-                "detail": (
-                    f"Low <b>{curr_low:.4f}</b> menyentuh MA200 <b>{ma200:.4f}</b>\n"
-                    f"💪 Bounce close <b>{curr_close:.4f}</b> (+{candle_body:.1f}%)"
-                )
-            })
-    return results
+    except Exception as e:
+        print(f"  [SKIP] {symbol}: {e}")
+
+    return symbol, signals
 
 # ============================================================
-#  FORMAT PESAN TELEGRAM
+#  FORMAT PESAN
 # ============================================================
 
 SIGNAL_META = {
@@ -213,72 +276,83 @@ SIGNAL_META = {
     "PULLBACK_BOUNCE":("🎯", "Pullback Bounce ke MA200"),
 }
 
-def format_message(symbol, signal_type, data):
+def format_message(symbol, signal_type, tf, detail, rank, total):
     emoji, label = SIGNAL_META.get(signal_type, ("📊", signal_type))
-    lines = [
-        f"{emoji} <b>{label}</b>",
-        f"🪙 <b>{symbol}</b>  [{data.get('tf','')}]",
-        f"",
-        data.get("detail", ""),
-        f"",
-        f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-    ]
-    return "\n".join(lines)
+    source = "Binance" if DATA_SOURCE == "binance" else "Bybit"
+    return "\n".join([
+        f"{emoji} <b>{label}</b>  [{rank}/{total}]",
+        f"🪙 <b>{symbol}</b>  [{tf}]",
+        "",
+        detail,
+        "",
+        f"📡 {source} | 🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+    ])
 
 # ============================================================
 #  SCAN UTAMA
 # ============================================================
 
 def scan_all():
+    start = time.time()
     print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Mulai scanning...")
 
     try:
-        pairs = get_all_usdt_pairs()
+        pairs = get_all_pairs()
     except Exception as e:
-        print(f"[ERROR] Gagal ambil pairs: {e}")
+        print(f"[FATAL] {e}")
+        send_telegram(f"❌ <b>Bot Error</b>\n{e}")
         return
 
-    print(f"Total pairs: {len(pairs)}")
-    total_signals = 0
+    pairs = pre_filter(pairs)
+    print(f"Source: {DATA_SOURCE.upper()} | {len(pairs)} pairs | {MAX_WORKERS} threads")
 
-    for i, symbol in enumerate(pairs):
-        try:
-            closes_4h  = get_closes(symbol, "4h")
-            closes_1d  = get_closes(symbol, "1d")
-            candles_4h = get_candles_full(symbol, "4h")
-            candles_1d = get_candles_full(symbol, "1d")
+    # Kumpulkan semua sinyal dulu, baru kirim
+    all_signals = []
 
-            sinyal = [
-                ("MA200_CROSS",    check_signal_1_ma200_cross(closes_4h, closes_1d)),
-                ("RSI_RECOVERY",   check_signal_2_rsi_recovery(closes_4h, closes_1d)),
-                ("MA50_CROSS",     check_signal_3_ma50_cross_4h(closes_4h)),
-                ("PULLBACK_BOUNCE",check_signal_4_pullback_bounce(candles_4h, candles_1d)),
-            ]
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(scan_symbol, sym): sym for sym in pairs}
+        done = 0
+        for future in as_completed(futures):
+            symbol, signals = future.result()
+            done += 1
+            for s in signals:
+                all_signals.append((symbol,) + s)
+            if done % 100 == 0:
+                print(f"  Progress scan: {done}/{len(pairs)}")
 
-            for signal_type, results in sinyal:
-                for data in results:
-                    msg = format_message(symbol, signal_type, data)
-                    send_telegram(msg)
-                    total_signals += 1
-                    print(f"  [SIGNAL] {symbol} — {signal_type} [{data.get('tf','')}]")
-                    time.sleep(0.3)  # jeda antar notif
+    elapsed_scan = time.time() - start
+    total_found  = len(all_signals)
+    total_sent   = min(total_found, MAX_SIGNALS_PER_SCAN)
 
-            # Rate limit protection
-            if (i + 1) % 50 == 0:
-                print(f"  Progress: {i+1}/{len(pairs)}")
-                time.sleep(1)
-            else:
-                time.sleep(0.15)
+    print(f"\nScan selesai dalam {elapsed_scan:.1f}s")
+    print(f"Sinyal ditemukan: {total_found} | Akan dikirim: {total_sent} (max {MAX_SIGNALS_PER_SCAN})")
 
-        except Exception as e:
-            print(f"  [SKIP] {symbol}: {e}")
-            continue
+    if total_found == 0:
+        print("Tidak ada sinyal.")
+        return
 
-    if total_signals == 0:
-        print("  Tidak ada sinyal ditemukan.")
-    else:
-        print(f"  Total sinyal terkirim: {total_signals}")
-    print("Scan selesai.")
+    # Prioritaskan sinyal: MA200_CROSS & PULLBACK_BOUNCE duluan
+    priority = {"MA200_CROSS": 0, "PULLBACK_BOUNCE": 1, "RSI_RECOVERY": 2, "MA50_CROSS": 3}
+    all_signals.sort(key=lambda x: priority.get(x[1], 9))
+
+    # Kirim satu per satu dengan rate limit protection
+    for i, (symbol, signal_type, tf, detail) in enumerate(all_signals[:MAX_SIGNALS_PER_SCAN]):
+        msg = format_message(symbol, signal_type, tf, detail, i+1, total_sent)
+        ok  = send_telegram(msg)
+        status = "✓" if ok else "✗"
+        print(f"  [{status}] {i+1}/{total_sent} {symbol} — {signal_type} [{tf}]")
+
+    # Kalau ada sinyal yang tidak terkirim karena limit, kasih summary
+    if total_found > MAX_SIGNALS_PER_SCAN:
+        sisa = total_found - MAX_SIGNALS_PER_SCAN
+        send_telegram(
+            f"ℹ️ <b>+{sisa} sinyal lainnya</b> tidak dikirim untuk menghindari flood.\n"
+            f"Total sinyal ditemukan: <b>{total_found}</b>\n"
+            f"Scan berikutnya dalam 15 menit."
+        )
+
+    total_elapsed = time.time() - start
+    print(f"Total waktu: {total_elapsed:.1f}s | Sinyal terkirim: {total_sent}")
 
 # ============================================================
 #  ENTRY POINT
