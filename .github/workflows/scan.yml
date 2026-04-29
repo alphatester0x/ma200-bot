@@ -5,8 +5,8 @@ on:
     - cron: '*/15 * * * *'  # setiap 15 menit
   workflow_dispatch:  # bisa trigger manual
 push:
-branches:
-- main
+  branches:
+    - main
 
 jobs:
   scan:
