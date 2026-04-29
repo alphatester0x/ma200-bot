@@ -4,6 +4,9 @@ on:
   schedule:
     - cron: '*/15 * * * *'  # setiap 15 menit
   workflow_dispatch:  # bisa trigger manual
+push:
+branches:
+- main
 
 jobs:
   scan:
