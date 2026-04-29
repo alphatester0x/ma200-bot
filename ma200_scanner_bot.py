@@ -172,8 +172,8 @@ def scan_all():
 
 import os
 
-TELEGRAM_BOT_TOKEN = os.environ.get("8753880668:AAG8fXPJD-Zp3f-BFjoQHgEjSZPc6aAdY2U")
-TELEGRAM_CHAT_ID   = os.environ.get("243258418")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
 
 # Ganti bagian "if __name__ == '__main__'" jadi ini:
 if __name__ == "__main__":
