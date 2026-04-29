@@ -170,14 +170,11 @@ def scan_all():
 #  JALANKAN BOT
 # ============================================================
 
-if __name__ == "__main__":
-    send_telegram(
-        "🤖 <b>MA200 Scanner Bot aktif!</b>\n"
-        f"Scan setiap {SCAN_INTERVAL_MINUTES} menit.\n"
-        "Memantau semua USDT pairs di Binance.\n"
-        "Timeframe: 4H dan 1D"
-    )
+import os
 
-    while True:
-        scan_all()
-        time.sleep(SCAN_INTERVAL_MINUTES * 60)
+TELEGRAM_BOT_TOKEN = os.environ.get("8753880668:AAG8fXPJD-Zp3f-BFjoQHgEjSZPc6aAdY2U")
+TELEGRAM_CHAT_ID   = os.environ.get("243258418")
+
+# Ganti bagian "if __name__ == '__main__'" jadi ini:
+if __name__ == "__main__":
+    scan_all()  # Jalankan sekali, lalu selesai
