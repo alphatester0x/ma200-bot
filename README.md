@@ -1,1 +1,1 @@
-bot aktif
+bot aktif euy
