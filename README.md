@@ -1,1 +1,1 @@
-bot aktif euy
+bot aktif euy ini teh
