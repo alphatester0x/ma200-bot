@@ -16,9 +16,11 @@ GIST_FILENAME        = "ma200_tracked.json"
 
 MAX_WORKERS          = 30
 MAX_SIGNALS_PER_SCAN = 15
-PROFIT_TARGET_PCT    = 10.0   # notif kalau naik >= 10%
-MAX_TRACK_HOURS      = 72     # hapus token dari tracking setelah 72 jam
+PROFIT_TARGET_PCT    = 10.0
+STOPLOSS_PCT         = -15.0
+MAX_TRACK_HOURS      = 72
 BINANCE_BASE         = "https://data-api.binance.vision"
+
 
 SESSION = requests.Session()
 adapter = requests.adapters.HTTPAdapter(
@@ -28,14 +30,14 @@ SESSION.mount("https://", adapter)
 SESSION.headers.update({"Accept-Encoding": "gzip", "Connection": "keep-alive"})
 
 # ============================================================
-#  GIST — simpan & load data tracking
+#  GIST
 # ============================================================
 
 def gist_find_id():
-    """Cari Gist ID yang sudah ada dengan filename kita."""
     headers = {"Authorization": f"Bearer {GIST_TOKEN}"}
     resp    = requests.get("https://api.github.com/gists", headers=headers, timeout=10)
     if resp.status_code != 200:
+        print(f"  [GIST] gagal list: {resp.status_code}")
         return None
     for g in resp.json():
         if GIST_FILENAME in g.get("files", {}):
@@ -43,7 +45,6 @@ def gist_find_id():
     return None
 
 def gist_create():
-    """Buat Gist baru untuk tracking."""
     headers = {"Authorization": f"Bearer {GIST_TOKEN}"}
     payload = {
         "description": "MA200 Bot — Signal Tracker",
@@ -56,31 +57,30 @@ def gist_create():
         gid = resp.json()["id"]
         print(f"  Gist baru dibuat: {gid}")
         return gid
-    print(f"  Gagal buat Gist: {resp.status_code}")
+    print(f"  Gagal buat Gist: {resp.status_code} {resp.text[:100]}")
     return None
 
 def gist_load():
-    """Load data tracking dari Gist. Return dict."""
     gid = gist_find_id()
     if not gid:
         gid = gist_create()
     if not gid:
         return {}, None
-
     headers = {"Authorization": f"Bearer {GIST_TOKEN}"}
     resp    = requests.get(f"https://api.github.com/gists/{gid}",
                            headers=headers, timeout=10)
     if resp.status_code != 200:
+        print(f"  [GIST] gagal load: {resp.status_code}")
         return {}, gid
-
     raw = resp.json()["files"].get(GIST_FILENAME, {}).get("content", "{}")
     try:
-        return json.loads(raw), gid
+        data = json.loads(raw)
+        print(f"  Gist loaded: {len(data)} token ditracking")
+        return data, gid
     except Exception:
         return {}, gid
 
 def gist_save(gid, data):
-    """Simpan data tracking ke Gist."""
     if not gid:
         return
     headers = {"Authorization": f"Bearer {GIST_TOKEN}"}
@@ -88,9 +88,9 @@ def gist_save(gid, data):
     resp    = requests.patch(f"https://api.github.com/gists/{gid}",
                              headers=headers, json=payload, timeout=10)
     if resp.status_code == 200:
-        print(f"  Gist tersimpan ({len(data)} token tracked)")
+        print(f"  Gist saved: {len(data)} token")
     else:
-        print(f"  Gagal simpan Gist: {resp.status_code}")
+        print(f"  [GIST] gagal save: {resp.status_code}")
 
 # ============================================================
 #  TELEGRAM
@@ -150,17 +150,22 @@ def fetch(symbol, interval):
         return None
 
 def get_current_price(symbol):
-    """Ambil harga terkini dari ticker."""
+    """
+    Ambil harga terkini pakai klines 1m limit 1.
+    Compatible dengan data-api.binance.vision.
+    Close price candle 1 menit terakhir = harga terkini.
+    """
     try:
         resp = SESSION.get(
-            f"{BINANCE_BASE}/api/v3/ticker/price",
-            params={"symbol": symbol},
+            f"{BINANCE_BASE}/api/v3/klines",
+            params={"symbol": symbol, "interval": "1m", "limit": 1},
             timeout=5
         )
         if resp.status_code == 200:
-            return float(resp.json()["price"])
-    except Exception:
-        pass
+            return float(resp.json()[0][4])  # index 4 = close price
+        print(f"  [PRICE] {symbol} HTTP {resp.status_code}")
+    except Exception as e:
+        print(f"  [PRICE ERROR] {symbol}: {e}")
     return None
 
 # ============================================================
@@ -204,75 +209,78 @@ def rsi(c, n=14):
     return 100 if al == 0 else 100 - 100/(1+ag/al)
 
 # ============================================================
-#  PRICE TRACKER — cek token yang sudah dapat sinyal
+#  PRICE TRACKER
 # ============================================================
 
-def check_tracked(tracked, gid):
+def check_tracked(tracked):
     """
-    Cek semua token yang sedang ditracking.
-    Kalau naik >= 10% dari entry → notif & hapus dari tracking.
-    Kalau sudah > 72 jam → hapus dari tracking.
+    Cek semua token yang ditracking.
+    FIX: pakai info["symbol"] bukan key untuk get_current_price().
     """
     if not tracked:
+        print("  Tidak ada token yang ditracking.")
         return tracked
 
-    now         = datetime.utcnow().timestamp()
-    to_delete   = []
-    updated     = dict(tracked)
+    now       = datetime.utcnow().timestamp()
+    to_delete = []
+    updated   = dict(tracked)
 
     print(f"\n  Cek {len(tracked)} token yang ditracking...")
 
-    for symbol, info in tracked.items():
-        entry_price  = info["entry"]
-        entry_time   = info["time"]
-        signal_type  = info.get("signal", "")
-        tf           = info.get("tf", "")
-        hours_passed = (now - entry_time) / 3600
+    for key, info in tracked.items():
+        symbol      = info["symbol"]      # ← FIX: pakai symbol asli
+        entry_price = info["entry"]
+        entry_time  = info["time"]
+        sig_type    = info.get("signal", "")
+        tf          = info.get("tf", "")
+        hours       = (now - entry_time) / 3600
 
-        # Expired — lebih dari MAX_TRACK_HOURS jam
-        if hours_passed > MAX_TRACK_HOURS:
-            print(f"  [EXPIRED] {symbol} — {hours_passed:.0f} jam, dihapus")
-            to_delete.append(symbol)
+        # Expired
+        if hours > MAX_TRACK_HOURS:
+            print(f"  [EXPIRED] {symbol} ({hours:.0f}h) — dihapus")
+            to_delete.append(key)
             continue
 
-        curr_price = get_current_price(symbol)
-        if curr_price is None:
+        curr = get_current_price(symbol)
+        if curr is None:
+            print(f"  [SKIP] {symbol} — gagal ambil harga")
             continue
 
-        change_pct = (curr_price - entry_price) / entry_price * 100
-        print(f"  {symbol}: entry={entry_price:.4f} now={curr_price:.4f} ({change_pct:+.1f}%)")
+        pct = (curr - entry_price) / entry_price * 100
+        print(f"  {symbol} [{tf}]: entry={entry_price:.6f} now={curr:.6f} ({pct:+.1f}%)")
 
-        # Target tercapai >= 10%
-        if change_pct >= PROFIT_TARGET_PCT:
+        # Target profit tercapai
+        if pct >= PROFIT_TARGET_PCT:
             send_telegram(
                 f"🎯 <b>TARGET +{PROFIT_TARGET_PCT:.0f}% TERCAPAI!</b>\n"
                 f"🪙 <b>{symbol}</b>  [{tf}]\n\n"
-                f"📥 Entry  : <b>{entry_price:.4f}</b>\n"
-                f"📤 Sekarang: <b>{curr_price:.4f}</b>\n"
-                f"📈 Profit  : <b>+{change_pct:.1f}%</b> 🚀\n\n"
-                f"⏱ Sinyal awal: {signal_type}\n"
+                f"📥 Entry   : <b>{entry_price:.6f}</b>\n"
+                f"📤 Sekarang: <b>{curr:.6f}</b>\n"
+                f"📈 Profit  : <b>+{pct:.1f}%</b> 🚀\n\n"
+                f"⏱ Sinyal: {sig_type}\n"
                 f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
             )
             time.sleep(1)
-            to_delete.append(symbol)
+            to_delete.append(key)
 
-        # Nyangkut parah >= -15% — notif warning
-        elif change_pct <= -15:
+        # Stop loss warning
+        elif pct <= STOPLOSS_PCT:
             send_telegram(
                 f"⚠️ <b>STOP LOSS WARNING</b>\n"
                 f"🪙 <b>{symbol}</b>  [{tf}]\n\n"
-                f"📥 Entry  : <b>{entry_price:.4f}</b>\n"
-                f"📤 Sekarang: <b>{curr_price:.4f}</b>\n"
-                f"📉 Loss    : <b>{change_pct:.1f}%</b>\n\n"
+                f"📥 Entry   : <b>{entry_price:.6f}</b>\n"
+                f"📤 Sekarang: <b>{curr:.6f}</b>\n"
+                f"📉 Loss    : <b>{pct:.1f}%</b>\n\n"
                 f"⚠️ Pertimbangkan cut loss!\n"
                 f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
             )
             time.sleep(1)
-            to_delete.append(symbol)
+            to_delete.append(key)
 
-    for sym in to_delete:
-        updated.pop(sym, None)
+    for k in to_delete:
+        updated.pop(k, None)
 
+    print(f"  Selesai cek tracker. Hapus: {len(to_delete)} | Sisa: {len(updated)}")
     return updated
 
 # ============================================================
@@ -291,7 +299,7 @@ def scan_symbol(symbol):
 
         ma200c = sma(closes, 200)
         ma200p = sma_p(closes, 200)
-        ma50c  = sma(closes, 50)  if tf == "4H" else None
+        ma50c  = sma(closes, 50)   if tf == "4H" else None
         ma50p  = sma_p(closes, 50) if tf == "4H" else None
         e50    = ema(closes, 50)
         e200   = ema(closes, 200)
@@ -307,18 +315,24 @@ def scan_symbol(symbol):
         pc   = closes[-2]
         body = (cc - co) / co * 100
 
+        # Filter volume — HARD FILTER (wajib lolos)
         avg_v  = sum(vols[-21:-1]) / 20
         vol_ok = vols[-1] > avg_v
         vol_r  = vols[-1] / avg_v if avg_v > 0 else 0
-        grn_ok = cc > co
-        gc_ok  = e50 > e200
-        score  = vol_ok + grn_ok + gc_ok
 
-        if score < 2:
+        if not vol_ok:          # ← volume wajib > 1x average
+            continue
+
+        # Filter tambahan
+        grn_ok = cc > co        # candle hijau
+        gc_ok  = e50 > e200     # EMA golden cross
+        score  = vol_ok + grn_ok + gc_ok  # 1-3 (vol selalu 1 karena sudah lolos)
+
+        if score < 2:           # minimal 2/3 filter lolos
             continue
 
         conf = (
-            f"{'✅' if vol_ok else '⚠️'} Vol: {vol_r:.1f}x avg\n"
+            f"✅ Vol: {vol_r:.1f}x avg\n"
             f"{'✅' if grn_ok else '⚠️'} Candle: {'Hijau' if grn_ok else 'Merah'}\n"
             f"{'✅' if gc_ok else '⚠️'} EMA GC: {'Ya' if gc_ok else 'Belum'}"
         )
@@ -326,27 +340,27 @@ def scan_symbol(symbol):
         # Sinyal 1: MA200 Cross
         if ma200p and pc < ma200p and cc > ma200c:
             signals.append(("MA200_CROSS", tf, score, cc,
-                f"Close <b>{cc:.4f}</b> crossing MA200 <b>{ma200c:.4f}</b>\n\n"
+                f"Close <b>{cc:.6f}</b> crossing MA200 <b>{ma200c:.6f}</b>\n\n"
                 f"<b>Konfirmasi:</b>\n{conf}"))
 
         # Sinyal 2: RSI Recovery
         if rsic and rsip and cc > ma200c and rsip < 35 and rsic >= 35:
             signals.append(("RSI_RECOVERY", tf, score, cc,
-                f"Close <b>{cc:.4f}</b> > MA200 <b>{ma200c:.4f}</b>\n"
+                f"Close <b>{cc:.6f}</b> > MA200 <b>{ma200c:.6f}</b>\n"
                 f"RSI: <b>{rsip:.1f}</b> → <b>{rsic:.1f}</b>\n\n"
                 f"<b>Konfirmasi:</b>\n{conf}"))
 
         # Sinyal 3: MA50 Cross (4H only)
         if tf == "4H" and ma50c and ma50p and pc < ma50p and cc > ma50c:
             signals.append(("MA50_CROSS", tf, score, cc,
-                f"Close <b>{cc:.4f}</b> crossing MA50 <b>{ma50c:.4f}</b>\n\n"
+                f"Close <b>{cc:.6f}</b> crossing MA50 <b>{ma50c:.6f}</b>\n\n"
                 f"<b>Konfirmasi:</b>\n{conf}"))
 
         # Sinyal 4: Pullback Bounce
         if cl <= ma200c * 1.01 and cc > ma200c and body > 0.5:
             signals.append(("PULLBACK_BOUNCE", tf, score, cc,
-                f"Low <b>{cl:.4f}</b> sentuh MA200 <b>{ma200c:.4f}</b>\n"
-                f"Bounce <b>{cc:.4f}</b> (+{body:.1f}%)\n\n"
+                f"Low <b>{cl:.6f}</b> sentuh MA200 <b>{ma200c:.6f}</b>\n"
+                f"Bounce <b>{cc:.6f}</b> (+{body:.1f}%)\n\n"
                 f"<b>Konfirmasi:</b>\n{conf}"))
 
     return symbol, signals
@@ -382,12 +396,11 @@ def scan_all():
     t0 = time.time()
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Scanning...")
 
-    # 1. Load tracking data dari Gist
+    # 1. Load tracking dari Gist
     tracked, gid = gist_load()
-    print(f"  Loaded {len(tracked)} token dari Gist")
 
-    # 2. Cek profit target token yang sudah ditracking
-    tracked = check_tracked(tracked, gid)
+    # 2. Cek profit/SL token yang ditracking
+    tracked = check_tracked(tracked)
 
     # 3. Ambil pairs
     try:
@@ -417,20 +430,19 @@ def scan_all():
     send_n = min(found, MAX_SIGNALS_PER_SCAN)
     print(f"Scan: {t_scan:.1f}s | Sinyal: {found} | Kirim: {send_n}")
 
-    # 5. Sort & kirim sinyal baru
+    # 5. Sort & kirim
     all_sig.sort(key=lambda x: (-x[3], PRIO.get(x[2], 9)))
 
     new_tracked = 0
     for i, (sym, st, tf, sc, entry_price, det) in enumerate(all_sig[:send_n]):
         send_telegram(fmt(sym, st, tf, det, sc, i+1, send_n))
-        print(f"  ✓ {i+1}/{send_n} {sym} {st} [{tf}] entry={entry_price:.4f}")
+        print(f"  ✓ {i+1}/{send_n} {sym} {st} [{tf}] entry={entry_price:.6f}")
         time.sleep(1)
 
-        # Tambahkan ke tracking kalau belum ada
         key = f"{sym}_{tf}"
         if key not in tracked:
             tracked[key] = {
-                "symbol": sym,
+                "symbol": sym,           # ← simpan symbol asli
                 "entry":  entry_price,
                 "time":   datetime.utcnow().timestamp(),
                 "signal": st,
@@ -444,10 +456,11 @@ def scan_all():
             f"Total: <b>{found}</b> | Terkirim: <b>{send_n}</b>"
         )
 
-    # 6. Simpan tracking ke Gist
+    # 6. Simpan ke Gist
     gist_save(gid, tracked)
-    print(f"Tracking: +{new_tracked} baru | total {len(tracked)} token")
-    print(f"Total waktu: {time.time()-t0:.1f}s")
+    print(f"Tracking: +{new_tracked} baru | total {len(tracked)}")
+    print(f"Total: {time.time()-t0:.1f}s")
 
 if __name__ == "__main__":
     scan_all()
+    
