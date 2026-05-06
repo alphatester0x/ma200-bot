@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 TELEGRAM_BOT_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID     = os.environ.get("TELEGRAM_CHAT_ID")
-GIST_TOKEN           = os.environ.get("GITHUB_GIST_TOKEN")
+GIST_TOKEN           = os.environ.get("GIST_TOKEN")
 GIST_FILENAME        = "ma200_tracked.json"
 
 MAX_WORKERS          = 30
