@@ -1,1 +1,1 @@
-bot aktif euy ini teh
+AKTIF BOS!
