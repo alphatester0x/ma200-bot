@@ -21,6 +21,7 @@ STOPLOSS_PCT         = -15.0
 MAX_TRACK_HOURS      = 72
 BINANCE_BASE         = "https://data-api.binance.vision"
 
+
 SESSION = requests.Session()
 adapter = requests.adapters.HTTPAdapter(
     pool_connections=30, pool_maxsize=30, max_retries=1
@@ -127,11 +128,11 @@ def get_pairs():
         and s["isSpotTradingAllowed"]
     ]
 
-def fetch(symbol, interval, limit=220):
+def fetch(symbol, interval):
     try:
         resp = SESSION.get(
             f"{BINANCE_BASE}/api/v3/klines",
-            params={"symbol": symbol, "interval": interval, "limit": limit},
+            params={"symbol": symbol, "interval": interval, "limit": 220},
             timeout=6
         )
         if resp.status_code != 200:
@@ -149,6 +150,11 @@ def fetch(symbol, interval, limit=220):
         return None
 
 def get_current_price(symbol):
+    """
+    Ambil harga terkini pakai klines 1m limit 1.
+    Compatible dengan data-api.binance.vision.
+    Close price candle 1 menit terakhir = harga terkini.
+    """
     try:
         resp = SESSION.get(
             f"{BINANCE_BASE}/api/v3/klines",
@@ -156,7 +162,7 @@ def get_current_price(symbol):
             timeout=5
         )
         if resp.status_code == 200:
-            return float(resp.json()[0][4])
+            return float(resp.json()[0][4])  # index 4 = close price
         print(f"  [PRICE] {symbol} HTTP {resp.status_code}")
     except Exception as e:
         print(f"  [PRICE ERROR] {symbol}: {e}")
@@ -194,72 +200,23 @@ def ema(c, n):
         v = x*k + v*(1-k)
     return v
 
-def rsi_wilder(c, n=14):
-    """
-    FIX 1: RSI pakai Wilder's Smoothing (standar industri).
-    Lebih akurat dari simple average karena sesuai dengan
-    RSI yang ditampilkan di TradingView dan platform lainnya.
-    """
-    if len(c) < n + 1:
-        return None, None
-
-    deltas = [c[i+1] - c[i] for i in range(len(c)-1)]
-
-    # Seed pertama: simple average dari n periode pertama
-    gains  = [max(d, 0) for d in deltas[:n]]
-    losses = [max(-d, 0) for d in deltas[:n]]
-    avg_gain = sum(gains) / n
-    avg_loss = sum(losses) / n
-
-    # Wilder's smoothing untuk periode berikutnya
-    for d in deltas[n:]:
-        gain = max(d, 0)
-        loss = max(-d, 0)
-        avg_gain = (avg_gain * (n-1) + gain) / n
-        avg_loss = (avg_loss * (n-1) + loss) / n
-
-    curr_rsi = 100 if avg_loss == 0 else 100 - 100 / (1 + avg_gain / avg_loss)
-
-    # Hitung RSI candle sebelumnya
-    deltas_prev = deltas[:-1]
-    gains_p  = [max(d, 0) for d in deltas_prev[:n]]
-    losses_p = [max(-d, 0) for d in deltas_prev[:n]]
-    avg_gain_p = sum(gains_p) / n
-    avg_loss_p = sum(losses_p) / n
-
-    for d in deltas_prev[n:]:
-        gain = max(d, 0)
-        loss = max(-d, 0)
-        avg_gain_p = (avg_gain_p * (n-1) + gain) / n
-        avg_loss_p = (avg_loss_p * (n-1) + loss) / n
-
-    prev_rsi = 100 if avg_loss_p == 0 else 100 - 100 / (1 + avg_gain_p / avg_loss_p)
-
-    return curr_rsi, prev_rsi
-
-def get_btc_trend():
-    """
-    FIX 4: Cek trend BTC sebelum scan altcoin.
-    Kalau BTC di bawah MA200 daily → market bearish → skip semua sinyal 1D altcoin.
-    Return: True kalau BTC bullish (di atas MA200 daily), False kalau bearish.
-    """
-    data = fetch("BTCUSDT", "1d", 220)
-    if data is None:
-        return True  # kalau gagal fetch, tidak skip sinyal
-    closes = data[2]
-    ma200  = sma(closes, 200)
-    if ma200 is None:
-        return True
-    btc_above = closes[-1] > ma200
-    trend = "BULLISH" if btc_above else "BEARISH"
-    print(f"  BTC trend: {trend} (close={closes[-1]:.0f}, MA200={ma200:.0f})")
-    return btc_above
+def rsi(c, n=14):
+    if len(c) < n+2:
+        return None
+    d  = [c[i+1]-c[i] for i in range(len(c)-1)]
+    ag = sum(x for x in d[-n:] if x > 0) / n
+    al = sum(-x for x in d[-n:] if x < 0) / n
+    return 100 if al == 0 else 100 - 100/(1+ag/al)
 
 # ============================================================
 #  PRICE TRACKER
 # ============================================================
 
 def check_tracked(tracked):
+    """
+    Cek semua token yang ditracking.
+    FIX: pakai info["symbol"] bukan key untuk get_current_price().
+    """
     if not tracked:
         print("  Tidak ada token yang ditracking.")
         return tracked
@@ -271,13 +228,14 @@ def check_tracked(tracked):
     print(f"\n  Cek {len(tracked)} token yang ditracking...")
 
     for key, info in tracked.items():
-        symbol      = info["symbol"]
+        symbol      = info["symbol"]      # ← FIX: pakai symbol asli
         entry_price = info["entry"]
         entry_time  = info["time"]
         sig_type    = info.get("signal", "")
         tf          = info.get("tf", "")
         hours       = (now - entry_time) / 3600
 
+        # Expired
         if hours > MAX_TRACK_HOURS:
             print(f"  [EXPIRED] {symbol} ({hours:.0f}h) — dihapus")
             to_delete.append(key)
@@ -291,6 +249,7 @@ def check_tracked(tracked):
         pct = (curr - entry_price) / entry_price * 100
         print(f"  {symbol} [{tf}]: entry={entry_price:.6f} now={curr:.6f} ({pct:+.1f}%)")
 
+        # Target profit tercapai
         if pct >= PROFIT_TARGET_PCT:
             send_telegram(
                 f"🎯 <b>TARGET +{PROFIT_TARGET_PCT:.0f}% TERCAPAI!</b>\n"
@@ -304,6 +263,7 @@ def check_tracked(tracked):
             time.sleep(1)
             to_delete.append(key)
 
+        # Stop loss warning
         elif pct <= STOPLOSS_PCT:
             send_telegram(
                 f"⚠️ <b>STOP LOSS WARNING</b>\n"
@@ -327,7 +287,7 @@ def check_tracked(tracked):
 #  SCAN 1 TOKEN
 # ============================================================
 
-def scan_symbol(symbol, btc_bullish=True):
+def scan_symbol(symbol):
     signals = []
 
     for interval, tf in [("4h","4H"), ("1d","1D")]:
@@ -337,16 +297,14 @@ def scan_symbol(symbol, btc_bullish=True):
 
         opens, lows, closes, vols = data
 
-        # Hitung semua indikator sekali
         ma200c = sma(closes, 200)
         ma200p = sma_p(closes, 200)
         ma50c  = sma(closes, 50)   if tf == "4H" else None
         ma50p  = sma_p(closes, 50) if tf == "4H" else None
         e50    = ema(closes, 50)
         e200   = ema(closes, 200)
-
-        # FIX 1: RSI pakai Wilder's smoothing
-        rsic, rsip = rsi_wilder(closes)
+        rsic   = rsi(closes)
+        rsip   = rsi(closes[:-1])
 
         if not ma200c or not e50 or not e200:
             continue
@@ -357,32 +315,26 @@ def scan_symbol(symbol, btc_bullish=True):
         pc   = closes[-2]
         body = (cc - co) / co * 100
 
-        # FIX 5: Volume average dari 20 candle sebelum candle terakhir (lebih tepat)
+        # Filter volume — HARD FILTER (wajib lolos)
         avg_v  = sum(vols[-21:-1]) / 20
-        vol_ok = vols[-1] > avg_v          # volume harus > rata-rata
+        vol_ok = vols[-1] > avg_v
         vol_r  = vols[-1] / avg_v if avg_v > 0 else 0
 
-        # Hard filter: volume wajib lolos
-        if not vol_ok:
+        if not vol_ok:          # ← volume wajib > 1x average
             continue
 
         # Filter tambahan
-        grn_ok = cc > co
-        gc_ok  = e50 > e200
-        score  = int(vol_ok) + int(grn_ok) + int(gc_ok)
+        grn_ok = cc > co        # candle hijau
+        gc_ok  = e50 > e200     # EMA golden cross
+        score  = vol_ok + grn_ok + gc_ok  # 1-3 (vol selalu 1 karena sudah lolos)
 
-        # score: volume(wajib) + candle hijau + EMA GC = min 2 dari 3
-        if score < 2:
+        if score < 2:           # minimal 2/3 filter lolos
             continue
-
-        # BTC warning — tidak skip, tapi tambahkan label di notif
-        btc_warn = "\n⚠️ <b>BTC BEARISH</b> — trade dengan hati-hati!" if (tf == "1D" and not btc_bullish) else ""
 
         conf = (
             f"✅ Vol: {vol_r:.1f}x avg\n"
             f"{'✅' if grn_ok else '⚠️'} Candle: {'Hijau' if grn_ok else 'Merah'}\n"
             f"{'✅' if gc_ok else '⚠️'} EMA GC: {'Ya' if gc_ok else 'Belum'}"
-            f"{btc_warn}"
         )
 
         # Sinyal 1: MA200 Cross
@@ -391,7 +343,7 @@ def scan_symbol(symbol, btc_bullish=True):
                 f"Close <b>{cc:.6f}</b> crossing MA200 <b>{ma200c:.6f}</b>\n\n"
                 f"<b>Konfirmasi:</b>\n{conf}"))
 
-        # Sinyal 2: RSI Recovery — FIX 1: pakai RSI Wilder yang akurat
+        # Sinyal 2: RSI Recovery
         if rsic and rsip and cc > ma200c and rsip < 35 and rsic >= 35:
             signals.append(("RSI_RECOVERY", tf, score, cc,
                 f"Close <b>{cc:.6f}</b> > MA200 <b>{ma200c:.6f}</b>\n"
@@ -404,8 +356,7 @@ def scan_symbol(symbol, btc_bullish=True):
                 f"Close <b>{cc:.6f}</b> crossing MA50 <b>{ma50c:.6f}</b>\n\n"
                 f"<b>Konfirmasi:</b>\n{conf}"))
 
-        # FIX 3: Pullback Bounce — threshold lebih ketat (0.5% bukan 1%)
-        # Low harus menyentuh MA200 dalam range 0.5%, bukan 1%
+        # Sinyal 4: Pullback Bounce
         if cl <= ma200c * 1.01 and cc > ma200c and body > 0.5:
             signals.append(("PULLBACK_BOUNCE", tf, score, cc,
                 f"Low <b>{cl:.6f}</b> sentuh MA200 <b>{ma200c:.6f}</b>\n"
@@ -425,7 +376,6 @@ META  = {
     "PULLBACK_BOUNCE":("🎯","Pullback Bounce MA200"),
 }
 SCORE = {3:"🔥 STRONG", 2:"👍 MODERATE"}
-# FIX 2: Prioritas sort berdasarkan score (desc) lalu jenis sinyal
 PRIO  = {"MA200_CROSS":0,"PULLBACK_BOUNCE":1,"RSI_RECOVERY":2,"MA50_CROSS":3}
 
 def fmt(sym, st, tf, det, sc, i, tot):
@@ -460,18 +410,14 @@ def scan_all():
         return
 
     pairs = pre_filter(pairs)
+    print(f"\n{len(pairs)} pairs | {MAX_WORKERS} workers")
 
-    # FIX 4: Cek trend BTC sebelum scan
-    btc_bullish = get_btc_trend()
-
-    print(f"\n{len(pairs)} pairs | {MAX_WORKERS} workers | BTC: {'🟢' if btc_bullish else '🔴'}")
-
-    # 4. Scan paralel — pass btc_bullish ke tiap worker
+    # 4. Scan paralel
     all_sig = []
     done    = 0
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futs = {ex.submit(scan_symbol, s, btc_bullish): s for s in pairs}
+        futs = {ex.submit(scan_symbol, s): s for s in pairs}
         for f in as_completed(futs):
             sym, sigs = f.result()
             done += 1
@@ -484,19 +430,19 @@ def scan_all():
     send_n = min(found, MAX_SIGNALS_PER_SCAN)
     print(f"Scan: {t_scan:.1f}s | Sinyal: {found} | Kirim: {send_n}")
 
-    # FIX 2: Sort benar — score index adalah [3] dalam tuple (sym, st, tf, score, price, det)
+    # 5. Sort & kirim
     all_sig.sort(key=lambda x: (-x[3], PRIO.get(x[2], 9)))
 
     new_tracked = 0
     for i, (sym, st, tf, sc, entry_price, det) in enumerate(all_sig[:send_n]):
         send_telegram(fmt(sym, st, tf, det, sc, i+1, send_n))
-        print(f"  ✓ {i+1}/{send_n} {sym} {st} [{tf}] score={sc} entry={entry_price:.6f}")
+        print(f"  ✓ {i+1}/{send_n} {sym} {st} [{tf}] entry={entry_price:.6f}")
         time.sleep(1)
 
         key = f"{sym}_{tf}"
         if key not in tracked:
             tracked[key] = {
-                "symbol": sym,
+                "symbol": sym,           # ← simpan symbol asli
                 "entry":  entry_price,
                 "time":   datetime.utcnow().timestamp(),
                 "signal": st,
@@ -507,8 +453,7 @@ def scan_all():
     if found > MAX_SIGNALS_PER_SCAN:
         send_telegram(
             f"ℹ️ <b>+{found-send_n} sinyal lain</b> tidak dikirim\n"
-            f"Total: <b>{found}</b> | Terkirim: <b>{send_n}</b>\n"
-            f"BTC: {'🟢 Bullish' if btc_bullish else '🔴 Bearish'}"
+            f"Total: <b>{found}</b> | Terkirim: <b>{send_n}</b>"
         )
 
     # 6. Simpan ke Gist
@@ -518,3 +463,4 @@ def scan_all():
 
 if __name__ == "__main__":
     scan_all()
+    
