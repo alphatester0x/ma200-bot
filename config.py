@@ -26,7 +26,7 @@ VOLUME_MULTIPLIER     = 2.0         # naik dari 1.5x → 2.0x (lebih selektif)
 MIN_RR_RATIO          = 1.5         # sinyal R/R < ini di-DROP (bukan cuma warning)
 MIN_VOL_USDT          = 500_000     # minimum volume 24h dalam USDT (filter low-liq)
 MAX_CROSS_DIST_PCT    = 3.0         # cross MA200 max 3% di atas MA200 (bukan kejaran)
-MIN_SCORE             = 3           # wajib STRONG (3/3), buang MODERATE (2/3)
+MIN_SCORE             = 2           # wajib STRONG (3/3), buang MODERATE (2/3)
 ATR_PERIOD            = 14
 MAX_ATR_PCT           = 15.0        # buang coin yang ATR-nya > 15% dari harga (terlalu volatile)
 
