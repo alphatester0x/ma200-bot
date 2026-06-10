@@ -59,8 +59,23 @@ SIGNAL_PRIORITY = {
 }
 
 SKIP_SYMBOLS = {
-    "USDCUSDT", "BUSDUSDT", "TUSDUSDT", "FDUSDUSDT", "BFUSDUSDT", "UUSDT", "RLUSDUSDT",
-    "PYUSDUSDT", "USDSUSDT", "DAIUSDT", "USDTUSDT", "BVNDUSDT",
+    # USDT & USD-pegged stablecoins
+    "USDCUSDT",    # USD Coin
+    "BUSDUSDT",    # Binance USD (deprecated)
+    "TUSDUSDT",    # TrueUSD
+    "FDUSDUSDT",   # First Digital USD
+    "PYUSDUSDT",   # PayPal USD
+    "USDSUSDT",    # Stably USD
+    "DAIUSDT",     # DAI
+    "USDTUSDT",
+    "BVNDUSDT",
+    "USD1USDT",    # World Liberty Financial USD (baru 2026)
+    "UUSDT",       # United Stables U (listing Jan 2026)
+    "USDPUSDT",    # Pax Dollar
+    "FRAXUSDT",    # Frax
+    "USTCUSDT",    # TerraUSD Classic (zombie stablecoin)
+    "EURCUSDT",    # Euro Coin — bukan USD tapi stablecoin
+    "EURSUSDT",    # Stasis Euro
 }
 SKIP_SUBSTRINGS = [
     "UPUSDT", "DOWNUSDT", "BEARUSDT", "BULLUSDT",
