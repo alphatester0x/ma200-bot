@@ -76,7 +76,10 @@ SKIP_SYMBOLS = {
     "USTCUSDT",    # TerraUSD Classic (zombie stablecoin)
     "EURCUSDT",    # Euro Coin — bukan USD tapi stablecoin
     "EURSUSDT",    # Stasis Euro
+    "XUSDUSDT",
+    "USDEUSDT",
 }
+
 SKIP_SUBSTRINGS = [
     "UPUSDT", "DOWNUSDT", "BEARUSDT", "BULLUSDT",
     "3LUSDT", "3SUSDT", "5LUSDT", "5SUSDT",
