@@ -78,6 +78,7 @@ SKIP_SYMBOLS = {
     "EURSUSDT",    # Stasis Euro
     "XUSDUSDT",
     "USDEUSDT",
+    "BFUSDUSDT",
 }
 
 SKIP_SUBSTRINGS = [
