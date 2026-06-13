@@ -20,7 +20,7 @@ MAX_SIGNALS_PER_SCAN  = 10          # turun dari 15 → quality over quantity
 PROFIT_TARGET_PCT     = 10.0
 STOPLOSS_PCT          = -15.0
 MAX_TRACK_HOURS       = 72
-VOLUME_MULTIPLIER     = 2.0         # naik dari 1.5x → 2.0x (lebih selektif)
+VOLUME_MULTIPLIER     = 1.0         # set ke 1x (minimum volume filter)
 
 # ── Quality filters ──────────────────────────────────────────
 MIN_RR_RATIO          = 1.5         # sinyal R/R < ini di-DROP (bukan cuma warning)
